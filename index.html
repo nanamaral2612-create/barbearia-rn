@@ -1014,11 +1014,12 @@ async function openOwnerArea() {
 }
 
 async function enter() {
-  let me;
-  try { me = await api('/api/me'); } catch { me = { owner: false }; }
+  let me, dbg = '';
+  try { me = await api('/api/me'); } catch (e) { me = { owner: false }; dbg = String(e?.message || e); }
   if (me.owner) return openPanel();
   modal(`<h3>Sem acesso</h3><p class="small">Você entrou${me.user ? ' como <b>' + esc(me.user.email) + '</b>' : ''}, mas essa conta não tem permissão de dono.</p>
     <p class="small">Entre com o e-mail cadastrado como dono do site.</p>
+    <p class="small" style="opacity:.6">Diagnóstico v3 · sessão: ${me.user ? 'sim' : 'não'} · ${esc(dbg || 'sem erro')}</p>
     <div class="inline"><button class="btn sm" data-out type="button">Sair</button><button class="btn o sm" data-x type="button">Fechar</button></div>`, (d) => {
     d.querySelector('[data-out]').onclick = async () => { await logout().catch(() => {}); d.close(); };
   });
