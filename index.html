@@ -417,4 +417,164 @@ footer.site{text-align:center;padding:28px 20px calc(28px + env(safe-area-inset-
 
 <script type="module" src="js/app.js"></script>
 </body>
-</html>
+</html>-- Barbearia do RN — banco de dados (cole tudo no Supabase → SQL Editor → Run)
+-- Dono: troque o e-mail na função is_owner() se precisar.
+
+create table if not exists public.bookings (
+  id serial primary key,
+  name text not null,
+  phone text not null,
+  service text not null,
+  duration_min integer not null,
+  date text not null,
+  start_min integer not null,
+  end_min integer not null,
+  note text not null default '',
+  status text not null default 'pendente',
+  created_at timestamptz not null default now()
+);
+create index if not exists bookings_date_idx on public.bookings (date);
+
+create table if not exists public.reviews (
+  id serial primary key,
+  name text not null,
+  rating integer not null check (rating between 1 and 5),
+  text text not null,
+  approved boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.settings (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz not null default now()
+);
+
+create or replace function public.is_owner() returns boolean
+language sql stable as $$
+  select coalesce(lower(auth.jwt() ->> 'email') = 'nanamaral2612@gmail.com', false)
+$$;
+
+alter table public.bookings enable row level security;
+alter table public.reviews  enable row level security;
+alter table public.settings enable row level security;
+
+-- agendamentos: só o dono lê e altera (o público usa as funções abaixo)
+drop policy if exists bookings_owner on public.bookings;
+create policy bookings_owner on public.bookings for all using (public.is_owner()) with check (public.is_owner());
+
+-- avaliações: todos leem as aprovadas e enviam novas (sempre "aguardando"); o dono gerencia
+drop policy if exists reviews_read on public.reviews;
+create policy reviews_read on public.reviews for select using (approved or public.is_owner());
+drop policy if exists reviews_insert on public.reviews;
+create policy reviews_insert on public.reviews for insert to anon, authenticated
+  with check (approved = false and char_length(name) between 2 and 60 and char_length(text) between 3 and 600);
+drop policy if exists reviews_owner_upd on public.reviews;
+create policy reviews_owner_upd on public.reviews for update using (public.is_owner()) with check (public.is_owner());
+drop policy if exists reviews_owner_del on public.reviews;
+create policy reviews_owner_del on public.reviews for delete using (public.is_owner());
+
+-- configurações: todos leem, só o dono altera
+drop policy if exists settings_read on public.settings;
+create policy settings_read on public.settings for select using (key = 'config');
+drop policy if exists settings_owner_ins on public.settings;
+create policy settings_owner_ins on public.settings for insert with check (public.is_owner());
+drop policy if exists settings_owner_upd on public.settings;
+create policy settings_owner_upd on public.settings for update using (public.is_owner()) with check (public.is_owner());
+drop policy if exists settings_owner_del on public.settings;
+create policy settings_owner_del on public.settings for delete using (public.is_owner());
+
+-- horários ocupados (sem expor nomes nem telefones)
+create or replace function public.get_busy(p_date text)
+returns table(s int, e int) language sql security definer set search_path = public as $$
+  select start_min, end_min from public.bookings where date = p_date and status <> 'cancelado'
+$$;
+
+-- cria o agendamento com todas as validações, sem deixar dois clientes pegarem o mesmo horário
+create or replace function public.create_booking(p_name text, p_phone text, p_service text, p_date text, p_time text, p_note text)
+returns int language plpgsql security definer set search_path = public as $$
+declare
+  cfg jsonb; svc jsonb; h jsonb; s int; e int; hs int; he int; phone text; new_id int;
+  nowbr timestamp := (now() at time zone 'America/Sao_Paulo');
+begin
+  phone := regexp_replace(coalesce(p_phone, ''), '\D', '', 'g');
+  if char_length(trim(coalesce(p_name, ''))) < 2 or char_length(p_name) > 80 then raise exception 'Informe seu nome.'; end if;
+  if char_length(phone) < 10 or char_length(phone) > 13 then raise exception 'Informe seu WhatsApp com DDD.'; end if;
+  if p_date !~ '^\d{4}-\d{2}-\d{2}$' or p_time !~ '^\d{2}:\d{2}$' then raise exception 'Escolha o dia e o horário.'; end if;
+
+  select value into cfg from public.settings where key = 'config';
+  select x into svc from jsonb_array_elements(cfg -> 'services') x where x ->> 'n' = p_service limit 1;
+  if svc is null then raise exception 'Serviço inválido.'; end if;
+
+  h := cfg -> 'hours' -> (extract(isodow from p_date::date)::int - 1);
+  s := split_part(p_time, ':', 1)::int * 60 + split_part(p_time, ':', 2)::int;
+  e := s + (svc ->> 'min')::int;
+  hs := split_part(h ->> 's', ':', 1)::int * 60 + split_part(h ->> 's', ':', 2)::int;
+  he := split_part(h ->> 'e', ':', 1)::int * 60 + split_part(h ->> 'e', ':', 2)::int;
+
+  if p_date::date < nowbr::date or (p_date::date = nowbr::date and s <= extract(hour from nowbr)::int * 60 + extract(minute from nowbr)::int) then
+    raise exception 'Esse horário já passou.';
+  end if;
+  if not coalesce((h ->> 'open')::boolean, false) or (cfg -> 'blockedDates') ? p_date then raise exception 'A barbearia não atende nesse dia.'; end if;
+  if s < hs or e > he then raise exception 'Horário fora do funcionamento.'; end if;
+
+  perform pg_advisory_xact_lock(hashtext(p_date));
+  if exists (select 1 from public.bookings where date = p_date and status <> 'cancelado' and start_min < e and end_min > s) then
+    raise exception 'Esse horário acabou de ser reservado. Escolha outro.' using errcode = 'P0409';
+  end if;
+
+  insert into public.bookings (name, phone, service, duration_min, date, start_min, end_min, note)
+  values (trim(p_name), phone, svc ->> 'n', (svc ->> 'min')::int, p_date, s, e, left(coalesce(p_note, ''), 300))
+  returning id into new_id;
+  return new_id;
+end $$;
+
+grant execute on function public.get_busy(text) to anon, authenticated;
+grant execute on function public.create_booking(text, text, text, text, text, text) to anon, authenticated;
+
+-- configuração inicial do site
+insert into public.settings (key, value) values ('config', '{
+ "services":[
+  {"n":"Corte masculino","p":"R$35","d":"Tesoura ou máquina, com acabamento.","min":30},
+  {"n":"Barba","p":"R$25","d":"Toalha quente e navalha.","min":30},
+  {"n":"Corte + barba","p":"R$45","d":"O combo completo.","min":60},
+  {"n":"Pigmento","p":"R$20","d":"Pigmento de cabelo e barba.","min":30},
+  {"n":"Sobrancelha","p":"R$10","d":"Na navalha ou na pinça.","min":15},
+  {"n":"Acabamento","p":"R$15","d":"Pezinho, risquinho e detalhes.","min":15},
+  {"n":"Nevou","p":"R$60","d":"Nevou barba e cabelo.","min":90}],
+ "hours":[
+  {"d":"Segunda","open":false,"s":"09:00","e":"22:00"},{"d":"Terça","open":true,"s":"09:00","e":"22:00"},
+  {"d":"Quarta","open":true,"s":"09:00","e":"22:00"},{"d":"Quinta","open":true,"s":"09:00","e":"22:00"},
+  {"d":"Sexta","open":true,"s":"09:00","e":"22:00"},{"d":"Sábado","open":true,"s":"09:00","e":"22:00"},
+  {"d":"Domingo","open":false,"s":"09:00","e":"22:00"}],
+ "blockedDates":[]}'::jsonb)
+on conflict (key) do nothing;
+
+# Barbearia do RN — GitHub Pages + Supabase
+
+O site fica no GitHub Pages (grátis). Agenda, avaliações e configurações ficam no banco do Supabase (grátis).
+
+## 1) Banco de dados (Supabase)
+1. Crie uma conta em supabase.com e um projeto novo.
+2. Abra **SQL Editor**, cole todo o `supabase.sql` e clique em **Run**.
+3. Em **Project Settings → API**, copie a *Project URL* e a chave *anon public*.
+4. Cole os dois valores em `js/config.js`.
+
+## 2) Login do dono (nanamaral2612@gmail.com)
+1. Em **Authentication → URL Configuration**, coloque o endereço do site (passo 3) em *Site URL* e em *Redirect URLs*.
+2. Publique o site, clique em **Área do dono → Primeiro acesso? Criar conta do dono**, use o e-mail `nanamaral2612@gmail.com` e uma senha com 8+ caracteres.
+3. Abra o e-mail de confirmação e depois entre. Só esse e-mail enxerga a agenda (a trava está no banco).
+4. Depois de criar a conta, desligue **Authentication → Sign In / Providers → Allow new users to sign up**, para ninguém mais criar conta.
+
+## 3) Publicar no GitHub Pages
+1. Crie um repositório e suba todos estes arquivos na raiz.
+2. **Settings → Pages → Deploy from a branch → main / (root)**.
+3. O endereço será `https://SEU-USUARIO.github.io/SEU-REPOSITORIO/`. Troque esse texto no `index.html` (canonical, og:url, og:image e dados estruturados) pelo endereço real.
+
+## Onde ver os dados
+Supabase → **Table Editor**: tabelas `bookings` (agenda), `reviews` e `settings`. O painel do dono do site mostra tudo de forma amigável.
+
+## Usar o Netlify só para hospedar (opcional)
+O `netlify.toml` incluído publica a raiz do projeto. Não há funções nem Netlify DB/Identity: banco e login são do Supabase. No GitHub Pages ele é ignorado.
+[build]
+  publish = "."
